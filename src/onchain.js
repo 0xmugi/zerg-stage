@@ -2,7 +2,6 @@ import {
   PublicKey,
   TransactionInstruction,
   SystemProgram,
-  SYSVAR_RENT_PUBKEY,
 } from '@solana/web3.js';
 
 // Covenant A program (stage/devnet) - from frontend chunk analysis
@@ -117,19 +116,20 @@ export function buildPurchaseIx({
     nonceLE,
   ]);
 
-  // Account order MUST match IDL `purchase_tbos.accounts` exactly:
-  // 1. global_config (PDA, W)
-  // 2. tbo_config (PDA, W)
-  // 3. campaign_tbo_config (PDA, W)
-  // 4. user_tbo_purchases (PDA, W) - init_if_needed
-  // 5. user_tbo_single_purchase (PDA, W) - init (this is why nonce must be unique)
-  // 6. signer (W, S)
-  // 7. token_program - Token-2022 (program also uses for token validation,
-  //    even when no transfer happens in this ix). Missing/wrong slot here
-  //    causes 0x1784 (InvalidTokenMint) on TBOs whose status validates it.
-  // 8. system_program (1111...)
-  // 9. associated_token_program (ATokenG...)
-  // 10. rent sysvar (SysvarRent111...)
+  // Account order as expected by the deployed program (verified by on-chain
+  // preflight probe — see `_probe_purchase.mjs`):
+  //   1. global_config (PDA, W)
+  //   2. tbo_config (PDA, W)
+  //   3. campaign_tbo_config (PDA, W)
+  //   4. user_tbo_purchases (PDA, W)
+  //   5. user_tbo_single_purchase (PDA, W) - init, needs unique nonce seed
+  //   6. signer (W, S)
+  //   7. system_program (1111...)
+  //
+  // NOTE: `docs/idl.json` lists 10 accounts (token_program, ATA, rent
+  // appended) but the deployed program actually rejects those extra
+  // accounts with `InvalidProgramId` (0xbc0) because slot 7 strictly
+  // validates as SystemProgram. IDL is outdated / doesn't match runtime.
   const keys = [
     { pubkey: pdas.globalConfig, isSigner: false, isWritable: true },
     { pubkey: pdas.tboConfig, isSigner: false, isWritable: true },
@@ -137,10 +137,7 @@ export function buildPurchaseIx({
     { pubkey: pdas.userTboPurchases, isSigner: false, isWritable: true },
     { pubkey: pdas.userTboSinglePurchase, isSigner: false, isWritable: true },
     { pubkey: signer, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    { pubkey: ATA_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
   ];
 
   const ix = new TransactionInstruction({
