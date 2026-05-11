@@ -4167,6 +4167,10 @@ async function runAutoTask(ctx) {
       bulkOpenTotal: 0,
       bulkOpenDone: 0,
       perToken: new Map(), // tokenId -> { bought, opened }
+      // Track last buy-fail error so the final per-account message can show
+      // WHY iterations failed (insufficient SOL, sold-out, nonce mismatch, …).
+      // Without this, a streak-abort just looks like "done" with no context.
+      lastError: null,
     };
     // Build the rich progress text — also exposed via currentJob.renderStatus
     // so /status can mirror the live message.
@@ -4284,6 +4288,37 @@ async function runAutoTask(ctx) {
               renderSub();
               break;
             }
+            case 'buy-fail': {
+              // Surface the actual error reason — without this the final
+              // message has no clue WHY iterations failed (insufficient SOL,
+              // sold-out, nonce mismatch, …).
+              const errStr =
+                typeof e.err === 'string'
+                  ? e.err
+                  : JSON.stringify(e.err)?.slice(0, 200) ?? 'unknown';
+              const logTail = Array.isArray(e.logs)
+                ? e.logs.slice(-3).join(' | ').slice(0, 200)
+                : '';
+              console.error(
+                `[auto-task buy-fail] ${accountName} iter=${e.i} err=${errStr}${
+                  logTail ? ` | logs: ${logTail}` : ''
+                }`,
+              );
+              subState.lastError = errStr;
+              subState.status = `✗ buy failed: ${errStr.slice(0, 50)}`;
+              renderSub();
+              break;
+            }
+            case 'open-fail': {
+              const errStr = (e.body ?? `HTTP ${e.status}`).slice(0, 100);
+              console.error(
+                `[auto-task open-fail] ${accountName} iter=${e.i} status=${e.status} body=${e.body}`,
+              );
+              subState.lastError = errStr;
+              subState.status = `✗ open failed: ${errStr.slice(0, 50)}`;
+              renderSub();
+              break;
+            }
             case 'open-ok': {
               const tokId = e.tokenId ?? subState.currentTokenId;
               const st = subState.perToken.get(tokId);
@@ -4332,6 +4367,12 @@ async function runAutoTask(ctx) {
               renderSub();
               break;
             case 'iter-error':
+              subState.lastError = String(e.error);
+              console.error(
+                `[auto-task iter-error] ${accountName} iter=${e.i}${
+                  e.tokenId ? ` token=${e.tokenId}` : ''
+                } err=${e.error}`,
+              );
               subState.status = `⚠ ${String(e.error).slice(0, 60)}`;
               renderSub();
               break;
@@ -4355,17 +4396,41 @@ async function runAutoTask(ctx) {
       currentJob = null;
     }
 
-    // Final per-account message (replaces the "starting…" subMsg)
-    const finalText = summary
-      ? `<b>✅ [${ai + 1}/${task.accountNames.length}] ${escapeHtml(accountName)} done</b>\n` +
+    // Final per-account message (replaces the "starting…" subMsg).
+    //
+    // Three outcomes:
+    //   ✅ done       — all iterations completed normally
+    //   ⚠ stopped    — runJob returned a summary but with abortReason set
+    //                  (streak-abort = 10 consecutive failures, usually
+    //                  insufficient SOL / sold-out / nonce mismatch)
+    //   ❌ failed    — runJob threw (login/network/etc, no summary)
+    let finalText;
+    if (!summary) {
+      finalText =
+        `<b>❌ [${ai + 1}/${task.accountNames.length}] ${escapeHtml(accountName)} failed</b>\n` +
+        `<i>${escapeHtml(task.results[task.results.length - 1]?.error ?? 'unknown')}</i>`;
+    } else {
+      const aborted = !!summary.abortReason;
+      const headerIcon = aborted ? '⚠' : '✅';
+      const headerLabel = aborted ? 'stopped early' : 'done';
+      const reasonLine = aborted
+        ? `\n<i>🛑 ${escapeHtml(summary.abortReason)}</i>` +
+          (subState.lastError
+            ? `\n<i>Last error:</i> <code>${escapeHtml(
+                String(subState.lastError).slice(0, 200),
+              )}</code>`
+            : '')
+        : '';
+      finalText =
+        `<b>${headerIcon} [${ai + 1}/${task.accountNames.length}] ${escapeHtml(accountName)} ${headerLabel}</b>\n` +
         `Iters ${summary.completedIters ?? summary.totalIters}/${summary.totalIters} · ` +
         `Tx ✓ ${summary.txOk} ✗ ${summary.txFail}\n` +
         `Bought <b>${summary.totalBought}</b> · Opened <b>${summary.totalOpened}</b>` +
         (summary.spentLamports != null
           ? `\nSpent ${fmtSol(summary.spentLamports)} SOL`
-          : '')
-      : `<b>❌ [${ai + 1}/${task.accountNames.length}] ${escapeHtml(accountName)} failed</b>\n` +
-        `<i>${escapeHtml(task.results[task.results.length - 1]?.error ?? 'unknown')}</i>`;
+          : '') +
+        reasonLine;
+    }
     await ctx.telegram
       .editMessageText(
         task.chatId,
