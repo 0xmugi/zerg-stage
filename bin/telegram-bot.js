@@ -2966,7 +2966,8 @@ async function prepareJob(
   const jobAccount = active();
   const jobAccountName = accounts.activeName;
 
-  // Fetch token details
+  // Fetch token details + gate on sale state (reject post-sale "claim" or
+  // expired sale window — program would reject purchase_tbos with 0x1784).
   const tokens = [];
   const errors = [];
   for (const id of tokenIds) {
@@ -2978,7 +2979,28 @@ async function prepareJob(
         );
         continue;
       }
-      tokens.push({ tokenId: id, data: det.data.data });
+      const d = det.data.data;
+      // In open-only mode the user already owns boxes — no sale gate needed.
+      if (!openOnly) {
+        const step = String(d?.step || '').toLowerCase();
+        const endStr = d?.campaign?.boxOffering?.endTimestamp;
+        const saleEnd = endStr ? new Date(endStr).getTime() : null;
+        const now = Date.now();
+        if (step === 'claim' || step === 'finished' || step === 'cashout') {
+          errors.push(
+            `${id.slice(0, 8)}… (${d?.token?.ticker || '?'}): sale udah berakhir (step=${step}), ga bisa di-buy lagi. Pakai /claim kalo mau claim tokens.`,
+          );
+          continue;
+        }
+        if (saleEnd && saleEnd < now) {
+          const mins = Math.round((now - saleEnd) / 60000);
+          errors.push(
+            `${id.slice(0, 8)}… (${d?.token?.ticker || '?'}): sale window expired ${mins}m lalu.`,
+          );
+          continue;
+        }
+      }
+      tokens.push({ tokenId: id, data: d });
     } catch (e) {
       errors.push(`${id}: ${e.message}`);
     }
@@ -4094,20 +4116,43 @@ async function runAutoTask(ctx) {
       )
       .catch(() => {});
 
-    // Fetch token details for this account's view
+    // Fetch token details for this account's view.
+    // Also gate on sale state — a token in post-sale ("step":"claim") or with
+    // an expired sale window causes the program to reject purchase_tbos with
+    // 0x1784 (InvalidTokenMint) / 0x1783 (TBONotInProposed). Surface the
+    // reason clearly instead of burning 10 iterations into a streak-abort.
     const tokens = [];
     const errors = [];
     for (const id of task.tokenIds) {
       if (task.abortCtrl.signal.aborted) break;
       try {
         const det = await acct.client.get(`/api/v1/tokens/${id}`);
-        if (det.ok && det.data?.success) {
-          tokens.push({ tokenId: id, data: det.data.data });
-        } else {
+        if (!(det.ok && det.data?.success)) {
           errors.push(
             `${id.slice(0, 8)}…: ${JSON.stringify(det.data).slice(0, 80)}`,
           );
+          continue;
         }
+        const d = det.data.data;
+        const step = String(d?.step || '').toLowerCase();
+        const endStr = d?.campaign?.boxOffering?.endTimestamp;
+        const saleEnd = endStr ? new Date(endStr).getTime() : null;
+        const now = Date.now();
+        // Reject if the sale is no longer accepting buys.
+        if (step === 'claim' || step === 'finished' || step === 'cashout') {
+          errors.push(
+            `${id.slice(0, 8)}… (${d?.token?.ticker || '?'}): sale sudah berakhir — step="${step}". Token sekarang di phase CLAIM, ga bisa dibeli lagi.`,
+          );
+          continue;
+        }
+        if (saleEnd && saleEnd < now) {
+          const mins = Math.round((now - saleEnd) / 60000);
+          errors.push(
+            `${id.slice(0, 8)}… (${d?.token?.ticker || '?'}): sale window udah expired ${mins}m lalu (${endStr}).`,
+          );
+          continue;
+        }
+        tokens.push({ tokenId: id, data: d });
       } catch (e) {
         errors.push(`${id.slice(0, 8)}…: ${e.message}`);
       }
