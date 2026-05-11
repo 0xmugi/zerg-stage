@@ -1,0 +1,23 @@
+node_modules/
+
+# Runtime data (private keys, account state) — never commit
+data/
+
+# Local config (API keys, RPC URLs, Telegram token)
+config.js
+
+# Misc
+.auth.json
+*.log
+.env
+.env.*
+
+# Editor / IDE
+.windsurf/
+.vscode/
+.idea/
+
+# Deploy / temp artifacts
+*.tar.gz
+_smoke*
+_diag*
