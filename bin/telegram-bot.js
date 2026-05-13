@@ -457,8 +457,9 @@ const cmdHelp = async (ctx) => {
       `<b>/check</b> - cek sisa spin per akun (gak burn quota)\n` +
       `<b>/daily</b> - spin gumball machine semua akun (max 10/akun/hari)\n` +
       `   pilih jeda antar akun: 5, 10, atau 15 menit\n` +
-      `   slow-spin mode: 8-20s antar spin (anti-bot)\n` +
-      `   auto skip akun yg udah max\n\n` +
+      `   retry-loop: 2-4s antar attempt, bail @ 30 fail beruntun\n` +
+      `   token bucket Zerg: ~4 spin per burst, refill ~5m\n` +
+      `   <i>kalo bail, /daily lagi 5-10m kemudian buat sisa quota</i>\n\n` +
       `<b>📱 Menu</b>\n` +
       `<b>/menu</b> - menu kategori (Wallet/Trading/Tasks/Info)\n` +
       `   tap tombol bawah chat buat shortcut\n\n` +
@@ -2354,7 +2355,7 @@ const cmdCheck = async (ctx) => {
 
   if (totalRemaining > 0 && !anyError) {
     lines.push('');
-    lines.push('<i>Pake /daily buat spin semua sekaligus (slow-spin mode).</i>');
+    lines.push('<i>Pake /daily buat spin semua (retry-loop, ~4 spin/burst).</i>');
   }
 
   // Send final result as NEW message — editMessageText can silently fail or
@@ -4614,7 +4615,7 @@ async function startDailyWizard(ctx) {
   await ctx.reply(
     `<b>🎰 Daily Gumball</b>\n\n` +
       `Pilih jeda antar akun (anti-bot):\n` +
-      `<i>Slow-spin mode aktif: 8-20s antar spin.</i>`,
+      `<i>Retry-loop mode: 2-4s antar attempt. Token bucket Zerg ~4 spin/burst.</i>`,
     {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
@@ -4640,8 +4641,8 @@ bot.action(/^dt:delay:(5|10|15)$/, async (ctx) => {
   sess.state = 'daily-confirm';
 
   const allNames = sess.data.allNames;
-  // ~10 spins × ~14s avg slow-spin delay + ~2s API per spin = ~160s ≈ 2.7m/akun.
-  const perAccountMin = 3;
+  // Retry-loop: ~30 attempts × ~3s avg + bail = up to ~90s/akun. Add 30s pad.
+  const perAccountMin = 2;
   const estTotalMin = (allNames.length - 1) * delayMin + allNames.length * perAccountMin;
 
   await ctx.answerCbQuery(`Jeda: ${delayMin}m`);
@@ -4678,7 +4679,7 @@ bot.action('dt:back', async (ctx) => {
   await ctx
     .editMessageText(
       `<b>🎰 Daily Gumball</b>\n\nPilih jeda antar akun (anti-bot):\n` +
-        `<i>Slow-spin mode aktif: 8-20s antar spin.</i>`,
+        `<i>Retry-loop mode: 2-4s antar attempt. Token bucket Zerg ~4 spin/burst.</i>`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
@@ -4921,10 +4922,14 @@ async function runDailyTask(ctx) {
       summary = await runDailyForAccount({
         client: acct.client,
         signal: task.abortCtrl.signal,
-        // Slow-spin mode: 8-20s between spins. The faster default
-        // (1.5-3.5s) plus other bot endpoints (buy/open) already triggers
-        // Zerg's per-IP anti-abuse → multi-hour 429 even at playsToday=0.
-        spinDelayMs: { min: 8000, max: 20000 },
+        // Token-bucket rate limit confirmed empirically: retrying through
+        // 429s gets ~13% to slip through on initial bursts, so 2-4s gap
+        // is the sweet spot — fast enough to ride the bucket, gentle
+        // enough to look human. See src/gumball.js for full notes.
+        spinDelayMs: { min: 2000, max: 4000 },
+        // Bail after 30 consecutive 429s (~75-120s). Means the bucket
+        // probably needs a 5-min refill — let caller schedule a retry pass.
+        maxConsecutiveFails: 30,
         onProgress: (e) => {
           switch (e.type) {
             case 'status':
@@ -4934,7 +4939,7 @@ async function runDailyTask(ctx) {
               } else if (subState.total === 0) {
                 subState.status = '✓ udah max hari ini';
               } else {
-                subState.status = `🎰 spinning ${subState.total} kali…`;
+                subState.status = `🎰 spinning sampe ${subState.total}…`;
               }
               renderSub();
               break;
@@ -4944,12 +4949,23 @@ async function runDailyTask(ctx) {
               subState.byRarity[e.prize.rarity] =
                 (subState.byRarity[e.prize.rarity] ?? 0) + 1;
               subState.lastPrize = `${rarityLabel(e.prize.rarity)} +${e.prize.xpAmount} XP`;
+              subState.status = `🎰 spinning · ${subState.done}/${subState.total}`;
               renderSub();
               break;
             case 'spin-fail':
-              console.error(`[daily spin-fail] ${accountName} #${e.index}: ${e.error}`);
-              subState.status = summarizeSpinError(e.error);
-              subState.finished = true; // we're about to break out
+              // Retry-loop active — log every 5th fail so terminal isn't spammed
+              if (e.consecutiveFails % 5 === 0 || e.consecutiveFails === 1) {
+                console.warn(
+                  `[daily spin-retry] ${accountName} consecutive=${e.consecutiveFails}: ${String(e.error).slice(0, 120)}`,
+                );
+              }
+              // Show retry status without marking subjob finished — runner
+              // is still trying.
+              if (subState.done > 0) {
+                subState.status = `🎰 ${subState.done}/${subState.total} · retry ${e.consecutiveFails}…`;
+              } else {
+                subState.status = `🎰 retry ${e.consecutiveFails}/30 …`;
+              }
               renderSub();
               break;
             case 'sleep':
@@ -4958,11 +4974,13 @@ async function runDailyTask(ctx) {
             case 'done':
               subState.finished = true;
               if (e.summary?.spins > 0) {
-                subState.status = `✅ selesai · +${e.summary.xpEarned} XP`;
+                const tail = e.summary.bailedOnConsecutiveFails
+                  ? ` (bail @ ${e.summary.attempts} attempts)`
+                  : '';
+                subState.status = `✅ selesai · +${e.summary.xpEarned} XP${tail}`;
               } else if (e.summary?.inactive) {
                 subState.status = '🚫 gumball nonaktif';
               } else if (e.summary?.lastError) {
-                // Keep the error already set by spin-fail (more specific)
                 subState.status = summarizeSpinError(e.summary.lastError);
               } else {
                 subState.status = '✓ ga ada spin tersisa';
@@ -4976,8 +4994,10 @@ async function runDailyTask(ctx) {
       grandXp += summary.xpEarned ?? 0;
       grandSpins += summary.spins ?? 0;
 
-      // IP-wide rate limit detection: if multiple accounts in a row return a
-      // long-retry 429, the IP is flagged. Stop wasting time on the rest.
+      // IP-wide bail logic: only flag if account got ZERO spins despite
+      // retrying — that means the token bucket is fully drained and refill
+      // hasn't helped. With the retry-loop, we expect at least 1 spin/account
+      // most of the time, so ZERO consistently is unusual.
       if (summary.spins === 0 && longRateLimitSecs(summary.lastError) > 0) {
         consecutiveLongRateLimit++;
       } else if (summary.spins > 0) {
@@ -5011,18 +5031,28 @@ async function runDailyTask(ctx) {
       summaryLine = `❌ <b>${escapeHtml(accountName)}</b> — ${escapeHtml(lastResult.error.slice(0, 120))}`;
     } else {
       const s = lastResult.summary ?? {};
+      const attemptsTail = s.attempts > s.spins ? ` (${s.attempts} attempts)` : '';
       if (s.inactive) {
         summaryLine = `🚫 <b>${escapeHtml(accountName)}</b> — gumball nonaktif`;
       } else if (s.spins === 0 && s.lastError) {
-        summaryLine = `❌ <b>${escapeHtml(accountName)}</b> — ${summarizeSpinError(s.lastError)}`;
+        // 0 spins despite retrying = token bucket depleted, retry pass nanti
+        summaryLine =
+          `❌ <b>${escapeHtml(accountName)}</b> — 0 spin (${s.attempts ?? 0} retries) · ` +
+          summarizeSpinError(s.lastError);
       } else if (s.spins === 0) {
         summaryLine = `✓ <b>${escapeHtml(accountName)}</b> — udah max hari ini`;
+      } else if (s.bailedOnConsecutiveFails) {
+        // Got some spins but token bucket drained — caller should re-run
+        // /daily after a few minutes to pick up remaining quota.
+        summaryLine =
+          `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
+          `bucket habis, /daily lagi 5-10m kemudian buat sisa quota`;
       } else if (s.lastError) {
         summaryLine =
-          `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin) · ` +
+          `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
           summarizeSpinError(s.lastError);
       } else {
-        summaryLine = `✅ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)`;
+        summaryLine = `✅ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail}`;
       }
     }
     await ctx.telegram
