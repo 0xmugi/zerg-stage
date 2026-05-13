@@ -4968,15 +4968,31 @@ async function runDailyTask(ctx) {
               }
               renderSub();
               break;
+            case 'wait-cooldown':
+              // Server told us exactly when next token drips — honor it.
+              // Visible to user so they don't think bot is stuck.
+              console.log(
+                `[daily wait-cooldown] ${accountName} sleeping ${e.retryAfterSec}s (${(e.ms / 1000).toFixed(0)}s)`,
+              );
+              if (subState.done > 0) {
+                subState.status = `🎰 ${subState.done}/${subState.total} · honor cooldown ${fmtMs(e.ms)}`;
+              } else {
+                subState.status = `⏳ honor cooldown ${fmtMs(e.ms)}`;
+              }
+              renderSub();
+              break;
             case 'sleep':
               // No render — too noisy and not informative
               break;
             case 'done':
               subState.finished = true;
               if (e.summary?.spins > 0) {
-                const tail = e.summary.bailedOnConsecutiveFails
-                  ? ` (bail @ ${e.summary.attempts} attempts)`
-                  : '';
+                let tail = '';
+                if (e.summary.bailedOnLongCooldown) {
+                  tail = ` (long cooldown after ${e.summary.attempts})`;
+                } else if (e.summary.bailedOnConsecutiveFails) {
+                  tail = ` (bail @ ${e.summary.attempts} attempts)`;
+                }
                 subState.status = `✅ selesai · +${e.summary.xpEarned} XP${tail}`;
               } else if (e.summary?.inactive) {
                 subState.status = '🚫 gumball nonaktif';
@@ -5041,9 +5057,15 @@ async function runDailyTask(ctx) {
           summarizeSpinError(s.lastError);
       } else if (s.spins === 0) {
         summaryLine = `✓ <b>${escapeHtml(accountName)}</b> — udah max hari ini`;
+      } else if (s.bailedOnLongCooldown) {
+        // Bucket fully drained, server gave long retry_after — wait for
+        // reset (midnight UTC) or the server-specified time.
+        summaryLine =
+          `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
+          summarizeSpinError(s.lastError);
       } else if (s.bailedOnConsecutiveFails) {
-        // Got some spins but token bucket drained — caller should re-run
-        // /daily after a few minutes to pick up remaining quota.
+        // Got some spins but bucket needs short refill — caller should
+        // re-run /daily after a few minutes to pick up remaining quota.
         summaryLine =
           `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
           `bucket habis, /daily lagi 5-10m kemudian buat sisa quota`;

@@ -67,21 +67,22 @@ export async function playGumball(client) {
  *   - 429 attempts do NOT escalate the cooldown — keep retrying.
  *   - ~13% of retries succeed during heavy spam (depends on bucket state).
  *
- * Therefore the runner uses a **retry loop** rather than break-on-first-429:
- *   - Sleep `spinDelayMs` between attempts (default 2-4s — short enough to
- *     burst through the initial bucket, long enough to look human-ish).
- *   - Stop only when:
- *       * `playsRemaining` (server-tracked daily quota) reaches 0, OR
- *       * `maxConsecutiveFails` 429s in a row (default 30 ≈ ~1.5 min, after
- *         which the bucket likely needs minutes to refill — bail and let
- *         caller schedule a retry pass later).
+ * The runner uses a **hybrid retry strategy**:
+ *   - Burst mode (small retry_after or none): rapid 2-4s retries, ride
+ *     the bucket while it has tokens. Bail after N consecutive fails.
+ *   - Smart-wait (retry_after 30s-MAX_SHORT_WAIT_SEC): server tells us
+ *     exactly when next token drips — honor it. Wait, retry once, repeat.
+ *   - Bail (retry_after > MAX_SHORT_WAIT_SEC OR cumulative wait too long):
+ *     bucket fully drained, let caller schedule a follow-up run.
  *
  * @param {object} opts
  * @param {ZergClient} opts.client
  * @param {AbortSignal} [opts.signal]
  * @param {(event:object)=>void} [opts.onProgress]
- * @param {{min:number,max:number}} [opts.spinDelayMs] — sleep between spins (ms)
- * @param {number} [opts.maxConsecutiveFails] — bail after this many 429s in a row
+ * @param {{min:number,max:number}} [opts.spinDelayMs] — sleep between burst retries (ms)
+ * @param {number} [opts.maxConsecutiveFails] — bail after this many burst 429s in a row
+ * @param {number} [opts.maxShortWaitSec] — retry_after below this → wait it out (default 480 = 8 min)
+ * @param {number} [opts.maxTotalWaitMs] — cumulative wait budget per account (default 15 min)
  *
  * Events:
  *   { type: 'status',       status }                            // initial status
@@ -89,10 +90,12 @@ export async function playGumball(client) {
  *   { type: 'spin-ok',      index, total, prize, attemptNo }    // success
  *   { type: 'spin-fail',    index, total, error, consecutiveFails } // 429/error
  *   { type: 'sleep',        ms, reason }                        // inter-attempt sleep
+ *   { type: 'wait-cooldown', ms, retryAfterSec }                // honoring server retry_after
  *   { type: 'done',         summary }                           // exhausted/bail
  *
  * Returned summary:
- *   { spins, xpEarned, byRarity, plays, attempts, lastError, bailedOnConsecutiveFails }
+ *   { spins, xpEarned, byRarity, plays, attempts, lastError,
+ *     bailedOnConsecutiveFails, bailedOnLongCooldown, totalWaitMs }
  */
 export async function runDailyForAccount({
   client,
@@ -100,6 +103,8 @@ export async function runDailyForAccount({
   onProgress,
   spinDelayMs = { min: 2000, max: 4000 },
   maxConsecutiveFails = 30,
+  maxShortWaitSec = 480,
+  maxTotalWaitMs = 15 * 60 * 1000,
 }) {
   const emit = (e) => {
     try {
@@ -125,11 +130,39 @@ export async function runDailyForAccount({
     attempts: 0,
     lastError: null,
     bailedOnConsecutiveFails: false,
+    bailedOnLongCooldown: false,
+    totalWaitMs: 0,
+  };
+
+  // Abort-aware sleeper. Resolves early if signal is aborted.
+  const interruptibleSleep = (ms) =>
+    new Promise((resolve) => {
+      if (signal?.aborted) return resolve();
+      const t = setTimeout(resolve, ms);
+      signal?.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(t);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+
+  // Parse "Retry after Ns" from a spin error message. Returns seconds or null.
+  const parseRetryAfter = (errMsg) => {
+    const m = /Retry after (\d+)s/i.exec(String(errMsg ?? ''));
+    return m ? Number(m[1]) : null;
   };
 
   let consecutiveFails = 0;
+  let bailedOnLongCooldown = false;
 
-  while (summary.spins < total && consecutiveFails < maxConsecutiveFails) {
+  while (
+    summary.spins < total &&
+    consecutiveFails < maxConsecutiveFails &&
+    !bailedOnLongCooldown
+  ) {
     if (signal?.aborted) break;
     summary.attempts++;
     emit({ type: 'spin-start', index: summary.spins + 1, total });
@@ -147,25 +180,48 @@ export async function runDailyForAccount({
         error: errMsg,
         consecutiveFails,
       });
-      // Don't break — keep retrying. Token bucket refills, some attempts
-      // slip through. Only stop after maxConsecutiveFails in a row.
+
+      // Hybrid recovery strategy:
+      //   1. Long retry_after (> maxShortWaitSec) → bail; bucket fully drained.
+      //   2. Short retry_after (30s - maxShortWaitSec) AND budget left → honor
+      //      the server's hint: sleep retry_after + 2s safety pad, retry once.
+      //      Reset consecutiveFails because the wait is a "controlled" pause.
+      //   3. Otherwise (small/no retry_after) → burst mode: 2-4s gap, retry.
+      const retryAfterSec = parseRetryAfter(errMsg);
+      const wouldExceedBudget =
+        retryAfterSec != null &&
+        summary.totalWaitMs + (retryAfterSec + 2) * 1000 > maxTotalWaitMs;
+
+      if (retryAfterSec != null && retryAfterSec > maxShortWaitSec) {
+        // Case 1: long cooldown → bail.
+        bailedOnLongCooldown = true;
+        break;
+      } else if (
+        retryAfterSec != null &&
+        retryAfterSec >= 30 &&
+        !wouldExceedBudget &&
+        !signal?.aborted
+      ) {
+        // Case 2: smart-wait.
+        const waitMs = (retryAfterSec + 2) * 1000;
+        emit({ type: 'wait-cooldown', ms: waitMs, retryAfterSec });
+        await interruptibleSleep(waitMs);
+        summary.totalWaitMs += waitMs;
+        consecutiveFails = 0; // controlled pause — don't count toward bail
+        continue;
+      } else if (wouldExceedBudget) {
+        // Would blow the per-account wait budget — bail like long cooldown.
+        bailedOnLongCooldown = true;
+        break;
+      }
+
+      // Case 3: burst-mode retry.
       if (consecutiveFails < maxConsecutiveFails && !signal?.aborted) {
         const delayMs =
           spinDelayMs.min +
           Math.floor(Math.random() * Math.max(1, spinDelayMs.max - spinDelayMs.min + 1));
-        emit({ type: 'sleep', ms: delayMs, reason: 'retry-after-fail' });
-        await new Promise((resolve) => {
-          if (signal?.aborted) return resolve();
-          const t = setTimeout(resolve, delayMs);
-          signal?.addEventListener(
-            'abort',
-            () => {
-              clearTimeout(t);
-              resolve();
-            },
-            { once: true },
-          );
-        });
+        emit({ type: 'sleep', ms: delayMs, reason: 'burst-retry' });
+        await interruptibleSleep(delayMs);
       }
       continue;
     }
@@ -176,29 +232,21 @@ export async function runDailyForAccount({
     summary.plays.push(prize);
     emit({ type: 'spin-ok', index: summary.spins, total, prize, attemptNo: summary.attempts });
 
-    // Anti-bot delay between attempts (skip on last)
-    if (summary.spins < total && consecutiveFails < maxConsecutiveFails && !signal?.aborted) {
+    // Anti-bot delay between successful spins (skip on last)
+    if (summary.spins < total && !signal?.aborted) {
       const delayMs =
         spinDelayMs.min +
         Math.floor(Math.random() * Math.max(1, spinDelayMs.max - spinDelayMs.min + 1));
       emit({ type: 'sleep', ms: delayMs, reason: 'after-success' });
-      await new Promise((resolve) => {
-        if (signal?.aborted) return resolve();
-        const t = setTimeout(resolve, delayMs);
-        signal?.addEventListener(
-          'abort',
-          () => {
-            clearTimeout(t);
-            resolve();
-          },
-          { once: true },
-        );
-      });
+      await interruptibleSleep(delayMs);
     }
   }
 
   if (consecutiveFails >= maxConsecutiveFails) {
     summary.bailedOnConsecutiveFails = true;
+  }
+  if (bailedOnLongCooldown) {
+    summary.bailedOnLongCooldown = true;
   }
 
   emit({ type: 'done', summary });
