@@ -457,9 +457,9 @@ const cmdHelp = async (ctx) => {
       `<b>/check</b> - cek sisa spin per akun (gak burn quota)\n` +
       `<b>/daily</b> - spin gumball machine semua akun (max 10/akun/hari)\n` +
       `   pilih jeda antar akun: 5, 10, atau 15 menit\n` +
-      `   retry-loop: 2-4s antar attempt, bail @ 30 fail beruntun\n` +
-      `   token bucket Zerg: ~4 spin per burst, refill ~5m\n` +
-      `   <i>kalo bail, /daily lagi 5-10m kemudian buat sisa quota</i>\n\n` +
+      `   multi-cycle retry: burst 30 × 2-4s, pause 5m, ulang sampe 5 cycle\n` +
+      `   total per akun up to ~27m sebelum bail (token bucket Zerg)\n` +
+      `   <i>kalo masih bail, /daily lagi setelah midnight UTC reset</i>\n\n` +
       `<b>📱 Menu</b>\n` +
       `<b>/menu</b> - menu kategori (Wallet/Trading/Tasks/Info)\n` +
       `   tap tombol bawah chat buat shortcut\n\n` +
@@ -2355,7 +2355,7 @@ const cmdCheck = async (ctx) => {
 
   if (totalRemaining > 0 && !anyError) {
     lines.push('');
-    lines.push('<i>Pake /daily buat spin semua (retry-loop, ~4 spin/burst).</i>');
+    lines.push('<i>Pake /daily buat spin semua (multi-cycle retry, sampe ~27m/akun).</i>');
   }
 
   // Send final result as NEW message — editMessageText can silently fail or
@@ -4615,7 +4615,7 @@ async function startDailyWizard(ctx) {
   await ctx.reply(
     `<b>🎰 Daily Gumball</b>\n\n` +
       `Pilih jeda antar akun (anti-bot):\n` +
-      `<i>Retry-loop mode: 2-4s antar attempt. Token bucket Zerg ~4 spin/burst.</i>`,
+      `<i>Multi-cycle retry: burst 30 × 2-4s × 5 cycles dengan pause 5m. Worst-case ~27m/akun.</i>`,
     {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
@@ -4641,8 +4641,10 @@ bot.action(/^dt:delay:(5|10|15)$/, async (ctx) => {
   sess.state = 'daily-confirm';
 
   const allNames = sess.data.allNames;
-  // Retry-loop: ~30 attempts × ~3s avg + bail = up to ~90s/akun. Add 30s pad.
-  const perAccountMin = 2;
+  // Multi-cycle: up to 5 cycles, each burst ~1.5m + pause 5m. Worst-case
+  // ~27m/akun but typically far less (success in cycle 1-2). Use 8m as a
+  // mid-estimate so estimasi total tidak misleading.
+  const perAccountMin = 8;
   const estTotalMin = (allNames.length - 1) * delayMin + allNames.length * perAccountMin;
 
   await ctx.answerCbQuery(`Jeda: ${delayMin}m`);
@@ -4679,7 +4681,7 @@ bot.action('dt:back', async (ctx) => {
   await ctx
     .editMessageText(
       `<b>🎰 Daily Gumball</b>\n\nPilih jeda antar akun (anti-bot):\n` +
-        `<i>Retry-loop mode: 2-4s antar attempt. Token bucket Zerg ~4 spin/burst.</i>`,
+        `<i>Multi-cycle retry: burst 30 × 2-4s × 5 cycles dengan pause 5m. Worst-case ~27m/akun.</i>`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
@@ -4953,18 +4955,18 @@ async function runDailyTask(ctx) {
               renderSub();
               break;
             case 'spin-fail':
-              // Retry-loop active — log every 5th fail so terminal isn't spammed
+              // Multi-cycle retry — log every 5th fail so terminal isn't spammed
               if (e.consecutiveFails % 5 === 0 || e.consecutiveFails === 1) {
                 console.warn(
-                  `[daily spin-retry] ${accountName} consecutive=${e.consecutiveFails}: ${String(e.error).slice(0, 120)}`,
+                  `[daily spin-retry] ${accountName} cycle=${e.cycle} consecutive=${e.consecutiveFails}: ${String(e.error).slice(0, 120)}`,
                 );
               }
               // Show retry status without marking subjob finished — runner
-              // is still trying.
+              // is still trying through cycles.
               if (subState.done > 0) {
-                subState.status = `🎰 ${subState.done}/${subState.total} · retry ${e.consecutiveFails}…`;
+                subState.status = `🎰 ${subState.done}/${subState.total} · cycle ${e.cycle} retry ${e.consecutiveFails}/30…`;
               } else {
-                subState.status = `🎰 retry ${e.consecutiveFails}/30 …`;
+                subState.status = `🎰 cycle ${e.cycle} retry ${e.consecutiveFails}/30…`;
               }
               renderSub();
               break;
@@ -4981,18 +4983,28 @@ async function runDailyTask(ctx) {
               }
               renderSub();
               break;
+            case 'cycle-pause':
+              // Burst ended (30 consecutive fails). Pausing to let bucket
+              // refill before next cycle.
+              console.log(
+                `[daily cycle-pause] ${accountName} cycle ${e.cycle}/${e.totalCycles} sleeping ${(e.ms / 1000).toFixed(0)}s`,
+              );
+              if (subState.done > 0) {
+                subState.status = `💤 ${subState.done}/${subState.total} · pause ${fmtMs(e.ms)} sebelum cycle ${e.cycle}/${e.totalCycles}`;
+              } else {
+                subState.status = `💤 pause ${fmtMs(e.ms)} sebelum cycle ${e.cycle}/${e.totalCycles}`;
+              }
+              renderSub();
+              break;
             case 'sleep':
               // No render — too noisy and not informative
               break;
             case 'done':
               subState.finished = true;
               if (e.summary?.spins > 0) {
-                let tail = '';
-                if (e.summary.bailedOnLongCooldown) {
-                  tail = ` (long cooldown after ${e.summary.attempts})`;
-                } else if (e.summary.bailedOnConsecutiveFails) {
-                  tail = ` (bail @ ${e.summary.attempts} attempts)`;
-                }
+                const tail = e.summary.bailedOnMaxCycles
+                  ? ` (bail after ${e.summary.cycles} cycles)`
+                  : '';
                 subState.status = `✅ selesai · +${e.summary.xpEarned} XP${tail}`;
               } else if (e.summary?.inactive) {
                 subState.status = '🚫 gumball nonaktif';
@@ -5057,18 +5069,14 @@ async function runDailyTask(ctx) {
           summarizeSpinError(s.lastError);
       } else if (s.spins === 0) {
         summaryLine = `✓ <b>${escapeHtml(accountName)}</b> — udah max hari ini`;
-      } else if (s.bailedOnLongCooldown) {
-        // Bucket fully drained, server gave long retry_after — wait for
-        // reset (midnight UTC) or the server-specified time.
+      } else if (s.bailedOnMaxCycles) {
+        // All retry cycles exhausted (default 5 × burst+pause). Bucket
+        // still locked — usually means server-imposed long cooldown that
+        // outlasted our retry budget. /daily lagi nanti.
         summaryLine =
           `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
+          `${s.cycles} cycles habis · ` +
           summarizeSpinError(s.lastError);
-      } else if (s.bailedOnConsecutiveFails) {
-        // Got some spins but bucket needs short refill — caller should
-        // re-run /daily after a few minutes to pick up remaining quota.
-        summaryLine =
-          `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
-          `bucket habis, /daily lagi 5-10m kemudian buat sisa quota`;
       } else if (s.lastError) {
         summaryLine =
           `⚠ <b>${escapeHtml(accountName)}</b> — +${s.xpEarned} XP (${s.spins} spin)${attemptsTail} · ` +
