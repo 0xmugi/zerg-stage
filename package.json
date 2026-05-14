@@ -8,7 +8,8 @@
     "start": "node bin/telegram-bot.js",
     "telegram": "node bin/telegram-bot.js",
     "bot": "node bin/bot.js",
-    "login": "node bin/login.js"
+    "login": "node bin/login.js",
+    "vault": "node bin/zerg-vault.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.8",

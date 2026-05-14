@@ -16,6 +16,7 @@ import path from 'node:path';
 import bs58 from 'bs58';
 import { Keypair } from '@solana/web3.js';
 import { ZergClient } from './client.js';
+import { readMaybeVault, writeMaybeVault } from './vault.js';
 
 function parsePrivateKey(raw) {
   const s = String(raw).trim();
@@ -35,20 +36,23 @@ export class AccountManager {
   }
 
   _read() {
+    // readMaybeVault transparently decrypts ZERG1 blobs when the vault key
+    // is configured, and returns plaintext as-is otherwise. So the rest of
+    // this code never has to think about encryption.
     if (fs.existsSync(this.storagePath)) {
-      const raw = fs.readFileSync(this.storagePath, 'utf8');
+      const raw = readMaybeVault(this.storagePath);
       return JSON.parse(raw);
     }
-    // Migrate from legacy pk.txt if available
+    // Migrate from legacy pk.txt if available (also vault-aware).
     if (this.legacyPkPath && fs.existsSync(this.legacyPkPath)) {
-      const pk = fs.readFileSync(this.legacyPkPath, 'utf8').trim();
+      const pk = readMaybeVault(this.legacyPkPath).trim();
       // Validate
       parsePrivateKey(pk);
       const migrated = {
         active: 'main',
         list: [{ name: 'main', privateKey: pk }],
       };
-      fs.writeFileSync(this.storagePath, JSON.stringify(migrated, null, 2));
+      writeMaybeVault(this.storagePath, JSON.stringify(migrated, null, 2));
       return migrated;
     }
     return { active: null, list: [] };
@@ -62,11 +66,9 @@ export class AccountManager {
         privateKey: a.privateKey,
       })),
     };
-    fs.writeFileSync(
-      this.storagePath,
-      JSON.stringify(out, null, 2) + '\n',
-      { mode: 0o600 }, // owner-only
-    );
+    // writeMaybeVault encrypts if vault key is loaded, plain otherwise;
+    // always mode 0o600.
+    writeMaybeVault(this.storagePath, JSON.stringify(out, null, 2) + '\n');
   }
 
   // Load all accounts from disk. Does NOT login - caller should login active

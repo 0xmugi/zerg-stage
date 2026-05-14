@@ -17,6 +17,7 @@ import { Telegraf, Markup } from 'telegraf';
 
 import { ZergClient } from '../src/client.js';
 import { AccountManager } from '../src/account-manager.js';
+import { readMaybeVault, writeMaybeVault } from '../src/vault.js';
 import { runJob, makePlan } from '../src/runner.js';
 import { MAX_PER_OPEN, openBoxes, claimTokens } from '../src/actions.js';
 import { setTimeout as sleepP } from 'node:timers/promises';
@@ -324,9 +325,9 @@ function _saveSessionsSoon() {
       for (const [k, v] of _sessionsMap) obj[String(k)] = v;
       // Ensure data/ dir exists (mkdir recursive is a no-op if present).
       fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
-      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(obj, _replacer, 2), {
-        mode: 0o600,
-      });
+      // writeMaybeVault encrypts when vault key is loaded, else plain;
+      // always mode 0o600.
+      writeMaybeVault(SESSIONS_FILE, JSON.stringify(obj, _replacer, 2));
     } catch (e) {
       console.error('[sessions] save fail:', e?.message ?? e);
     }
@@ -336,7 +337,9 @@ function _saveSessionsSoon() {
 function _loadSessions() {
   if (!fs.existsSync(SESSIONS_FILE)) return;
   try {
-    const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+    // readMaybeVault transparently decrypts ZERG1 blobs when vault key
+    // is configured, else returns plaintext as-is.
+    const raw = readMaybeVault(SESSIONS_FILE);
     if (!raw.trim()) return;
     const obj = JSON.parse(raw, _reviver);
     for (const [k, v] of Object.entries(obj)) {

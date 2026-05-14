@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
 import { Keypair } from '@solana/web3.js';
+import { readMaybeVault } from './vault.js';
 
 export const API_BASE = 'https://api-stage.zerg.app';
 export const ORIGIN = 'https://stage.zerg.app';
@@ -27,7 +28,9 @@ export const BASE_HEADERS = {
 };
 
 export function loadKeypair(pkPath) {
-  const raw = fs.readFileSync(pkPath, 'utf8').trim();
+  // readMaybeVault transparently decrypts ZERG1 blobs when a vault key
+  // is configured, and returns plaintext as-is otherwise.
+  const raw = readMaybeVault(pkPath).trim();
   const secret = bs58.decode(raw);
   if (secret.length === 64) return Keypair.fromSecretKey(secret);
   if (secret.length === 32) return Keypair.fromSeed(secret);
