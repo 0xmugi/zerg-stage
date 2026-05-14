@@ -21,6 +21,11 @@ config.js
 *.tar.gz
 _smoke*
 _diag*
+_check*
+_probe*
+_test*
+_dump*
+_details*
 
 # Vault keyfile — should live OUTSIDE the project dir anyway, but
 # guard against accidental check-in if anyone drops it here.
